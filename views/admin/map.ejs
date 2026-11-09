@@ -379,13 +379,16 @@
     .cp-meta-item { display: flex; gap: 8px; align-items: flex-start; color: #334155; font-size: 12px; }
     .cp-meta-item i { margin-top: 2px; color: #64748b; font-size: 13px; }
     .cp-meta-item span { overflow: hidden; text-overflow: ellipsis; }
-    .cp-traffic { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(148, 163, 184, 0.35); }
-    .cp-traffic-head { display: flex; align-items: center; gap: 8px; font-weight: 900; font-size: 12px; color: #0f172a; margin-bottom: 8px; }
-    .cp-traffic-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-    .cp-chart { position: relative; border-radius: 12px; padding: 8px; border: 1px solid rgba(148, 163, 184, 0.35); background: linear-gradient(180deg, rgba(248,250,252,0.95), rgba(255,255,255,0.95)); overflow: hidden; box-sizing: border-box; min-width: 0; }
-    .cp-chart-label { display: flex; align-items: center; gap: 6px; font-weight: 900; font-size: 11px; color: #0f172a; margin-bottom: 4px; }
-    .cp-spark { width: 100%; height: 60px; display: block; }
-    .cp-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 12px; color: #64748b; background: rgba(255,255,255,0.75); backdrop-filter: blur(2px); opacity: 0; pointer-events: none; }
+    /* Tampilan Kotak Popup Total Pemakaian agar Rapi & Kompak */
+    .cp-traffic { margin-top: 8px; padding-top: 8px; border-top: 1px solid #e2e8f0; }
+    .cp-traffic-head { display: flex; align-items: center; justify-content: space-between; font-weight: 800; font-size: 11.5px; color: #0f172a; margin-bottom: 6px; }
+    .cp-traffic-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .cp-chart { position: relative; border-radius: 8px; padding: 6px 8px; border: 1px solid #e2e8f0; background: #f8fafc; box-sizing: border-box; }
+    .cp-chart-label { display: flex; flex-direction: column; gap: 1px; margin-bottom: 2px; }
+    .cp-chart-title { display: flex; align-items: center; gap: 4px; font-weight: 700; font-size: 10.5px; color: #64748b; text-transform: uppercase; }
+    .cp-chart-val { font-family: monospace; font-weight: 800; font-size: 12.5px; color: #0f172a; }
+    .cp-spark { width: 100%; height: 35px; display: block; margin-top: 2px; }
+    .cp-overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-weight: 900; font-size: 11px; color: #64748b; background: rgba(255,255,255,0.85); backdrop-filter: blur(2px); opacity: 0; pointer-events: none; }
     .cp-overlay.on { opacity: 1; }
     .popup-actions { margin-top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
     .btn-wa { background: #25D366; border: 1px solid #25D366; color: #0b1220 !important; font-weight: 800; }
@@ -853,6 +856,71 @@
         <label class="fl"><%= t('admin.map.form.adjust_location', 'Sesuaikan Lokasi di Peta') %></label>
         <div id="edit-picker-map"></div>
 
+<!-- 1. Induk ODP -->
+<div class="fg">
+  <label class="fl">Induk ODP (Parent / Sumber Sinyal)</label>
+  <select name="parent_odp_id" id="e_odp_parent" class="fc" onchange="onParentOdpChanged()">
+    <option value="">-- ODP Pusat / Server Utama (+9 dBm) --</option>
+    <% odps.forEach(o => { %>
+      <option value="<%= o.id %>" data-input-db="<%= o.input_power_dbm || -9.0 %>"><%= o.name %></option>
+    <% }) %>
+  </select>
+</div>
+
+<!-- 2. Redaman Masuk -->
+<div class="fg">
+  <div style="display: flex; justify-content: space-between; align-items: center;">
+    <label class="fl" style="margin-bottom:0;">Redaman Masuk (Input Power dBm)</label>
+    <label style="font-size: 11px; cursor: pointer; color: #2563eb;">
+      <input type="checkbox" id="manual_override_dbm" onclick="toggleManualDbm(this)"> Edit Manual
+    </label>
+  </div>
+  <input type="number" step="0.1" name="input_power_dbm" id="e_odp_input_power" class="fc" value="-9.0" readonly style="background: #f1f5f9;">
+  <small class="text-muted" style="font-size: 10.5px;">*Terhitung otomatis dari hulu, centang "Edit Manual" jika ingin ubah sesuai OPM lapangan.</small>
+</div>
+
+<!-- 3. Konfigurasi Splitter dalam Box ODP -->
+<div class="fg">
+  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+    <label class="fl" style="margin-bottom:0;">Konfigurasi Splitter dalam Box ODP</label>
+    <button type="button" class="btn btn-sm btn-outline-primary" onclick="addSplitterRow()" style="font-size: 11px; padding: 2px 8px;">
+      <i class="bi bi-plus-circle"></i> Tambah Splitter
+    </button>
+  </div>
+  
+  <!-- Container untuk menampung baris-baris splitter (bisa lebih dari 1) -->
+  <div id="splitter-container">
+    <!-- Default 1 splitter awal -->
+    <div class="splitter-row" style="display: flex; gap: 8px; align-items: center; margin-bottom: 8px; background: #f8fafc; padding: 8px; border-radius: 8px; border: 1px solid #e2e8f0;">
+      <div style="flex: 1;">
+        <label style="font-size: 10px; font-weight: 700; color: #64748b;">TIPE</label>
+        <select name="splitter_types[]" class="fc splitter-type" onchange="updateSplitterRatios(this)">
+          <option value="PLC">PLC</option>
+          <option value="FBT">FBT</option>
+        </select>
+      </div>
+      <div style="flex: 1.5;">
+        <label style="font-size: 10px; font-weight: 700; color: #64748b;">RASIO</label>
+        <select name="splitter_ratios[]" class="fc splitter-ratio" onchange="recalculateEstimatedPower()">
+        </select>
+      </div>
+      <div style="padding-top: 14px;">
+        <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.splitter-row').remove(); recalculateEstimatedPower();" title="Hapus Splitter" style="visibility: hidden;"><i class="bi bi-trash"></i></button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 4. Alokasi & Routing Port Output Box -->
+<div class="fg" style="margin-top: 15px; border-top: 1px dashed #cbd5e1; padding-top: 12px;">
+  <label class="fl" style="font-weight: 800; color: #2563eb;"><i class="bi bi-hdd-network"></i> Alokasi & Routing Port Output Box</label>
+  <p class="text-muted" style="font-size: 11px; margin-bottom: 8px;">Tentukan jalur keluar masing-masing port splitter (ke Pelanggan, ke ODP lain, atau Kosong).</p>
+  
+  <div id="port-allocation-container" style="max-height: 200px; overflow-y: auto; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 8px;">
+    <div style="font-size: 11.5px; color: #64748b; text-align: center; padding: 10px;">Simpan atau pilih konfigurasi splitter terlebih dahulu.</div>
+  </div>
+</div>
+
         <div class="form-row">
             <div class="fg"><label class="fl"><%= t('admin.map.form.lat', 'Latitude') %></label><input type="text" name="lat" id="e_odp_lat" class="fc" required></div>
             <div class="fg"><label class="fl"><%= t('admin.map.form.lng', 'Longitude') %></label><input type="text" name="lng" id="e_odp_lng" class="fc" required></div>
@@ -891,6 +959,288 @@
 <script id="odps-data" type="application/json"><%- JSON.stringify(odps).replace(/<\/script/g, '<\\/script').replace(/<!--/g, '<\\!--') %></script>
 
 <script>
+// Data global list pelanggan dan odp untuk pilihan dropdown port
+const globalCustomers = JSON.parse(document.getElementById('customers-data').textContent || '[]');
+const globalOdps = JSON.parse(document.getElementById('odps-data').textContent || '[]');
+
+// --- [PERBAIKAN SINKRONISASI RASIO FBT & PLC PADA PORT] ---
+function getPortCountFromRatio(type, ratio) {
+  if (type === 'PLC') {
+    const match = ratio.match(/1:(\d+)/);
+    if (match && match[1]) return parseInt(match[1], 10);
+    return 8; 
+  } else if (type === 'FBT') {
+    return 2; // FBT selalu 2 port utama (Port 1 = Cabang, Port 2 = Trunk)
+  }
+  return 8;
+}
+
+function updateSplitterRatios(selectElement, selectedVal = '') {
+  const row = selectElement ? selectElement.closest('.splitter-row') : document;
+  const typeSelect = row ? row.querySelector('.splitter-type') : document.getElementById('e_odp_splitter_type');
+  const ratioSelect = row ? row.querySelector('.splitter-ratio') : document.getElementById('e_odp_splitter_ratio');
+  
+  if (!typeSelect || !ratioSelect) return;
+
+  const currentType = typeSelect.value || 'PLC';
+  const list = splitterOptionsData[currentType] || [];
+  
+  // Jika selectedVal kosong tapi ratioSelect sudah punya nilai, pertahankan jika masih valid
+  if (!selectedVal && ratioSelect.value) {
+    selectedVal = ratioSelect.value;
+  }
+
+  ratioSelect.innerHTML = '';
+  list.forEach(item => {
+    const opt = document.createElement('option');
+    opt.value = item.val;
+    opt.textContent = item.label;
+    if (item.val === selectedVal) opt.selected = true;
+    ratioSelect.appendChild(opt);
+  });
+
+  // Jika tidak ada yang terpilih, pilih opsi pertama
+  if (!ratioSelect.value && ratioSelect.options.length > 0) {
+    ratioSelect.selectedIndex = 0;
+  }
+
+  recalculateEstimatedPower();
+  
+  // Beri sedikit jeda mikro agar DOM membaca pilihan rasio terbaru sebelum merender port
+  setTimeout(() => {
+    renderPortAllocationUI(window.__currentEditingPorts || []);
+  }, 50);
+}
+
+function renderPortAllocationUI(existingPorts = []) {
+  window.__currentEditingPorts = existingPorts; // Simpan cache port saat sedang diedit
+  const container = document.getElementById('port-allocation-container');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  const rows = document.querySelectorAll('.splitter-row');
+  if (rows.length === 0) {
+    container.innerHTML = '<div style="font-size: 11.5px; color: #64748b; text-align: center; padding: 10px;">Belum ada splitter yang ditambahkan.</div>';
+    return;
+  }
+
+  let globalPortCounter = 1;
+
+  rows.forEach((row, sIndex) => {
+    const typeSelect = row.querySelector('.splitter-type');
+    const ratioSelect = row.querySelector('.splitter-ratio');
+    if (!typeSelect || !ratioSelect) return;
+
+    const type = typeSelect.value;
+    const ratio = ratioSelect.value || (type === 'PLC' ? '1:8' : '5:95');
+    const portCount = getPortCountFromRatio(type, ratio);
+
+    // Header label untuk Splitter ke-N
+    const header = document.createElement('div');
+    header.style.cssText = 'font-size: 11px; font-weight: 800; color: #b45309; margin: 8px 0 4px 2px; text-transform: uppercase; border-bottom: 1px solid #fed7aa; padding-bottom: 2px;';
+    header.textContent = `Splitter #${sIndex + 1} (${type} ${ratio} — Total ${portCount} Port)`;
+    container.appendChild(header);
+
+    for (let p = 1; p <= portCount; p++) {
+      let portLabel = `Port ${p}`;
+      if (type === 'FBT') {
+        const parts = ratio.split(':');
+        if (parts.length === 2) {
+          portLabel = (p === 1) ? `Port 1 (Cabang ${parts[0]}%)` : `Port 2 (Trunk ${parts[1]}%)`;
+        }
+      }
+
+      const matchedPort = existingPorts.find(ep => ep.port_number === p && Number(ep.splitter_index || 1) === (sIndex + 1)) ||
+                          existingPorts.find(ep => ep.port_number === globalPortCounter);
+
+      const targetType = matchedPort ? matchedPort.target_type : 'EMPTY';
+      const targetId = matchedPort ? matchedPort.target_id : '';
+
+      const portRow = document.createElement('div');
+      portRow.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 6px; background: #ffffff; padding: 6px; border-radius: 6px; border: 1px solid #e2e8f0;';
+
+      let customerOptions = '';
+      globalCustomers.forEach(c => {
+        const sel = (targetType === 'CUSTOMER' && Number(targetId) === Number(c.id)) ? 'selected' : '';
+        customerOptions += `<option value="CUSTOMER_${c.id}" ${sel}>Pelanggan: ${escapeHtml(c.name)}</option>`;
+      });
+
+      let odpOptions = '';
+      globalOdps.forEach(o => {
+        const sel = (targetType === 'CHILD_ODP' && Number(targetId) === Number(o.id)) ? 'selected' : '';
+        odpOptions += `<option value="CHILD_ODP_${o.id}" ${sel}>ODP Lanjutan: ${escapeHtml(o.name)}</option>`;
+      });
+
+      let internalSplitterOptions = '';
+      rows.forEach((_, innerIdx) => {
+        if (innerIdx !== sIndex) {
+          const valKey = `SPLITTER_${innerIdx + 1}`;
+          const sel = (targetType === 'INTERNAL_SPLITTER' && String(targetId) === String(innerIdx + 1)) ? 'selected' : '';
+          internalSplitterOptions += `<option value="${valKey}" ${sel}>Ke Splitter Internal #${innerIdx + 1} di Box Ini</option>`;
+        }
+      });
+
+      portRow.innerHTML = `
+        <div style="width: 140px; font-size: 11px; font-weight: 800; color: #334155;">${portLabel}</div>
+        <div style="flex: 1;">
+          <select name="port_targets[]" class="fc" style="padding: 4px 8px; font-size: 11.5px;">
+            <option value="EMPTY_${globalPortCounter}" ${targetType === 'EMPTY' ? 'selected' : ''}>-- Port Kosong (Tersedia) --</option>
+            <optgroup label="1. Sambung ke Pelanggan">
+              ${customerOptions}
+            </optgroup>
+            <optgroup label="2. Sambung ke ODP Lain (Trunk Eksternal)">
+              ${odpOptions}
+            </optgroup>
+            ${internalSplitterOptions ? `
+              <optgroup label="3. Sambung ke Splitter Lain dalam 1 Box">
+                ${internalSplitterOptions}
+              </optgroup>
+            ` : ''}
+          </select>
+          <input type="hidden" name="port_numbers[]" value="${p}">
+          <input type="hidden" name="port_splitter_indices[]" value="${sIndex + 1}">
+        </div>
+      `;
+
+      container.appendChild(portRow);
+      globalPortCounter++;
+    }
+  });
+}
+// -------------------------------------------------------------------
+
+const splitterOptionsData = {
+  PLC: [
+    { val: '1:2', label: '1:2 (~3.7 dB)' },
+    { val: '1:4', label: '1:4 (~7.4 dB)' },
+    { val: '1:8', label: '1:8 (~10.5 dB)' },
+    { val: '1:16', label: '1:16 (~13.8 dB)' },
+    { val: '1:32', label: '1:32 (~17.5 dB)' }
+  ],
+  FBT: [
+    { val: '1:99', label: '1:99 (Cabang 1%)' },
+    { val: '5:95', label: '5:95 (Cabang 5%)' },
+    { val: '10:90', label: '10:90 (Cabang 10%)' },
+    { val: '20:80', label: '20:80 (Cabang 20%)' },
+    { val: '50:50', label: '50:50 (Simetris FBT)' }
+  ]
+};
+
+const splitterLossMap = {
+  PLC: { '1:2': 3.7, '1:4': 7.4, '1:8': 10.5, '1:16': 13.8, '1:32': 17.5 },
+  FBT: { '1:99': 20.0, '5:95': 13.0, '10:90': 10.0, '20:80': 7.0, '50:50': 3.2 }
+};
+
+// Perbarui event listener agar setiap kali Tipe/Rasio splitter diubah atau ditambah, list port otomatis ikut merender ulang
+function updateSplitterRatios(selectElement, selectedVal = '') {
+  const row = selectElement ? selectElement.closest('.splitter-row') : document;
+  const typeSelect = row ? row.querySelector('.splitter-type') : document.getElementById('e_odp_splitter_type');
+  const ratioSelect = row ? row.querySelector('.splitter-ratio') : document.getElementById('e_odp_splitter_ratio');
+  
+  if (!typeSelect || !ratioSelect) return;
+
+  const currentType = typeSelect.value || 'PLC';
+  const list = splitterOptionsData[currentType] || [];
+  
+  ratioSelect.innerHTML = '';
+  list.forEach(item => {
+    const opt = document.createElement('option');
+    opt.value = item.val;
+    opt.textContent = item.label;
+    if (item.val === selectedVal) opt.selected = true;
+    ratioSelect.appendChild(opt);
+  });
+
+  recalculateEstimatedPower();
+  
+  // 👈 INI YANG MEMBUAT PORT LANGSUNG BERUBAH REAL-TIME TANPA REFRESH
+  if (typeof renderPortAllocationUI === 'function') {
+    renderPortAllocationUI(window.__currentEditingPorts || []);
+  }
+}
+// -------------------------------------------------------------------
+
+function recalculateEstimatedPower() {
+  const manualCheckbox = document.getElementById('manual_override_dbm');
+  const inputField = document.getElementById('e_odp_input_power');
+  if (!inputField || (manualCheckbox && manualCheckbox.checked)) return;
+
+  const parentSelect = document.getElementById('e_odp_parent');
+  let basePower = 9.0;
+
+  if (parentSelect && parentSelect.value) {
+    const selectedOpt = parentSelect.options[parentSelect.selectedIndex];
+    basePower = parseFloat(selectedOpt.getAttribute('data-input-db') || 9.0);
+  }
+
+  let totalSplitterLoss = 0;
+  const rows = document.querySelectorAll('.splitter-row');
+  
+  if (rows.length > 0) {
+    rows.forEach(row => {
+      const type = row.querySelector('.splitter-type').value;
+      const ratio = row.querySelector('.splitter-ratio').value;
+      const loss = (splitterLossMap[type] && splitterLossMap[type][ratio]) ? splitterLossMap[type][ratio] : 10.5;
+      totalSplitterLoss += loss;
+    });
+  } else {
+    const type = document.getElementById('e_odp_splitter_type')?.value || 'PLC';
+    const ratio = document.getElementById('e_odp_splitter_ratio')?.value || '1:8';
+    totalSplitterLoss = (splitterLossMap[type] && splitterLossMap[type][ratio]) ? splitterLossMap[type][ratio] : 10.5;
+  }
+
+  const estimatedPower = parseFloat((basePower - 1.5 - (totalSplitterLoss > 0 ? totalSplitterLoss * 0.2 : 0)).toFixed(1));
+  inputField.value = estimatedPower;
+}
+
+function addSplitterRow(type = 'PLC', ratio = '1:8') {
+  const container = document.getElementById('splitter-container');
+  if (!container) return;
+
+  const div = document.createElement('div');
+  div.className = 'splitter-row';
+  div.style.cssText = 'display: flex; gap: 8px; align-items: center; margin-bottom: 8px; background: #f8fafc; padding: 8px; border-radius: 8px; border: 1px solid #e2e8f0;';
+  
+  div.innerHTML = `
+    <div style="flex: 1;">
+      <label style="font-size: 10px; font-weight: 700; color: #64748b;">TIPE</label>
+      <select name="splitter_types[]" class="fc splitter-type" onchange="updateSplitterRatios(this)">
+        <option value="PLC" ${type==='PLC'?'selected':''}>PLC</option>
+        <option value="FBT" ${type==='FBT'?'selected':''}>FBT</option>
+      </select>
+    </div>
+    <div style="flex: 1.5;">
+      <label style="font-size: 10px; font-weight: 700; color: #64748b;">RASIO</label>
+      <select name="splitter_ratios[]" class="fc splitter-ratio" onchange="recalculateEstimatedPower(); renderPortAllocationUI(window.__currentEditingPorts || []);">
+      </select>
+    </div>
+    <div style="padding-top: 14px;">
+      <button type="button" class="btn btn-sm btn-danger" onclick="this.closest('.splitter-row').remove(); recalculateEstimatedPower(); renderPortAllocationUI(window.__currentEditingPorts || []);" title="Hapus Splitter"><i class="bi bi-trash"></i></button>
+    </div>
+  `;
+  
+  container.appendChild(div);
+  updateSplitterRatios(div.querySelector('.splitter-type'), ratio);
+}
+
+function toggleManualDbm(checkbox) {
+  const inputField = document.getElementById('e_odp_input_power');
+  if (!inputField) return;
+  if (checkbox.checked) {
+    inputField.removeAttribute('readonly');
+    inputField.style.background = '#ffffff';
+  } else {
+    inputField.setAttribute('readonly', 'true');
+    inputField.style.background = '#f1f5f9';
+    recalculateEstimatedPower();
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  updateSplitterRatios();
+});
+
   const I18N = {
     layerOsm: "<%= t('admin.map.layers.osm', 'OpenStreetMap') %>",
     layerHybrid: "<%= t('admin.map.layers.hybrid', 'Satelit (Hybrid)') %>",
@@ -966,12 +1316,25 @@
   const odpMap = {}; // odpId -> { marker, data, coord }
   const customerMap = {}; // custId -> { marker, data, polyline }
 
-  // 1. Render ODP Markers (Clean icon & floating text outline)
+  // 1. Render ODP Markers & ODP-to-ODP Cable Lines
   odps.forEach(odp => {
     if (odp.lat && odp.lng) {
       const lat = parseFloat(odp.lat);
       const lng = parseFloat(odp.lng);
       
+      // -- [KODE BARU: TARIK GARIS KABEL DARI ODP INDUK KE ODP ANAK] --
+      if (odp.parent_odp_id && odpMap[odp.parent_odp_id]) {
+        const parentCoord = odpMap[odp.parent_odp_id].coord;
+        L.polyline([parentCoord, [lat, lng]], {
+          color: '#f59e0b', // Warna oranye khas jalur ODP/Trunk
+          weight: 4,
+          opacity: 0.85,
+          dashArray: '6, 6',
+          className: 'flowing-line'
+        }).addTo(map);
+      }
+      // -------------------------------------------------------------
+
       const odpIcon = L.divIcon({
         className: 'custom-onu-icon',
         html: `
@@ -990,11 +1353,30 @@
 
       const marker = L.marker([lat, lng], { icon: odpIcon }).addTo(map);
       
+      // Buat daftar HTML port jika ada
+      let portsHtml = '<div style="margin-top:8px; max-height:120px; overflow-y:auto; border-top:1px solid #e2e8f0; padding-top:6px;"><div style="font-size:11px; font-weight:700; color:#64748b; margin-bottom:4px;">STATUS PORT SPLITTER:</div>';
+      if (odp.ports && odp.ports.length > 0) {
+        odp.ports.forEach(p => {
+          const isUsed = p.target_type && p.target_type !== 'EMPTY';
+          const badgeColor = isUsed ? '#10b981' : '#94a3b8';
+          const targetName = p.target_type === 'CUSTOMER' ? (p.customer_name || 'Pelanggan') : (p.target_type === 'CHILD_ODP' ? (p.child_odp_name || 'ODP Anak') : 'Kosong');
+          portsHtml += `<div style="font-size:10.5px; display:flex; justify-content:space-between; padding:2px 4px; border-bottom:1px solid #f1f5f9;">
+            <span>Port ${p.port_number}</span>
+            <span style="color:${badgeColor}; font-weight:700;">${targetName}</span>
+          </div>`;
+        });
+      } else {
+        portsHtml += '<div style="font-size:10.5px; color:#94a3b8;">Belum ada konfigurasi port.</div>';
+      }
+      portsHtml += '</div>';
+
       marker.bindPopup(`
-        <div class="popup-content">
+        <div class="popup-content" style="width: 240px;">
           <h6 style="font-weight: 800; color: #0f172a; margin-bottom: 6px;"><i class="bi bi-box-seam-fill text-warning me-1"></i> ${escapeHtml(odp.name)}</h6>
-          <div><strong>${I18N.popupDescription}:</strong> ${escapeHtml(odp.description || '-')}</div>
-          <div><strong>${I18N.popupLocation}:</strong> ${lat.toFixed(6)}, ${lng.toFixed(6)}</div>
+          <div style="font-size:11.5px;"><strong>Deskripsi:</strong> ${escapeHtml(odp.description || '-')}</div>
+          <div style="font-size:11.5px;"><strong>Redaman Masuk:</strong> ${Number(odp.input_power_dbm || -9.0)} dBm</div>
+          <div style="font-size:11.5px;"><strong>Induk:</strong> ${escapeHtml(odp.parent_odp_name || 'ODP Pusat / OLT')}</div>
+          ${portsHtml}
           <div class="popup-actions" style="margin-top: 10px;">
             <button class="btn btn-sm btn-p" onclick='editOdp(${JSON.stringify(odp)})'><i class="bi bi-pencil me-1"></i>${I18N.popupEdit}</button>
           </div>
@@ -1085,17 +1467,43 @@
             <div class="cp-meta-item"><i class="bi bi-geo-alt"></i><span>${escapeHtml(cust.address || '-')}</span></div>
           </div>
 
+          <!-- KETERANGAN: Struktur Tampilan Rapi (Total di Atas, Grafik DL/UL di Bawah & Tidak Terbalik) -->
+          <!-- --- [KODE BARU SETELAH TEKS LIVE DIHAPUS] --- -->
           <div class="cp-traffic">
-            <div class="cp-traffic-head"><i class="bi bi-activity"></i><span>Trafik Realtime</span></div>
+            <div class="cp-traffic-head">
+              <span style="display: flex; align-items: center; gap: 5px;">
+                <i class="bi bi-pie-chart-fill text-primary"></i> Pemakaian Hari Ini
+              </span>
+            </div>
+            
+            <!-- Kotak Akumulasi Total Harian di Atas -->
+            <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; margin-bottom: 6px; background: #eff6ff; padding: 6px 8px; border-radius: 6px; border: 1px solid #dbeafe;">
+              <div>
+                <div style="font-size: 9.5px; color: #1e40af; font-weight: 700; text-transform: uppercase;">Total Download</div>
+                <div id="cust_${cust.id}_daily_dl" style="font-family: monospace; font-weight: 800; font-size: 11.5px; color: #1d4ed8;">0 MB</div>
+              </div>
+              <div>
+                <div style="font-size: 9.5px; color: #166534; font-weight: 700; text-transform: uppercase;">Total Upload</div>
+                <div id="cust_${cust.id}_daily_ul" style="font-family: monospace; font-weight: 800; font-size: 11.5px; color: #15803d;">0 MB</div>
+              </div>
+            </div>
+
+            <!-- Grafik Realtime Mbps di Bawahnya -->
             <div class="cp-traffic-grid">
               <div class="cp-chart">
-                <div class="cp-chart-label"><i class="bi bi-download"></i><span>Download</span></div>
-                <canvas class="cp-spark" id="cust_${cust.id}_dl_chart" width="160" height="60" data-max="${downMaxMbps}"></canvas>
+                <div class="cp-chart-label">
+                  <div class="cp-chart-title"><i class="bi bi-download text-primary"></i> DL (Live)</div>
+                  <span id="cust_${cust.id}_dl_val" class="cp-chart-val" style="color: #3b82f6;">0.00 Mbps</span>
+                </div>
+                <canvas class="cp-spark" id="cust_${cust.id}_dl_chart" width="140" height="35" data-max="${downMaxMbps}"></canvas>
                 <div class="cp-overlay" id="cust_${cust.id}_dl_state"></div>
               </div>
               <div class="cp-chart">
-                <div class="cp-chart-label"><i class="bi bi-upload"></i><span>Upload</span></div>
-                <canvas class="cp-spark" id="cust_${cust.id}_ul_chart" width="160" height="60" data-max="${upMaxMbps}"></canvas>
+                <div class="cp-chart-label">
+                  <div class="cp-chart-title"><i class="bi bi-upload text-success"></i> UL (Live)</div>
+                  <span id="cust_${cust.id}_ul_val" class="cp-chart-val" style="color: #16a34a;">0.00 Mbps</span>
+                </div>
+                <canvas class="cp-spark" id="cust_${cust.id}_ul_chart" width="140" height="35" data-max="${upMaxMbps}"></canvas>
                 <div class="cp-overlay" id="cust_${cust.id}_ul_state"></div>
               </div>
             </div>
@@ -1607,33 +2015,57 @@
   }
 
   async function saveCablePath() {
-    if (!drawingPolyline || !currentEditingCustomer) return;
-    const latlngs = drawingPolyline.getLatLngs().map(ll => [ll.lat, ll.lng]);
-    const pathJson = JSON.stringify(latlngs);
-
-    try {
-      const res = await fetch(`/admin/api/customers/${currentEditingCustomer}/cable-path`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-        body: JSON.stringify({ path: pathJson })
-      });
-      
-      const contentType = res.headers.get("content-type");
-      if (contentType && contentType.indexOf("application/json") !== -1) {
-        const data = await res.json();
-        if (data.ok) {
-          alert('Jalur kabel berhasil disimpan!');
-          location.reload();
-        } else {
-          alert('Gagal menyimpan: ' + data.error);
-        }
-      } else {
-        alert('Gagal menyimpan jalur kabel.');
-      }
-    } catch (e) {
-      alert('Error: ' + e.message);
-    }
+  if (!drawingPolyline || !currentEditingCustomer) return;
+  const latlngs = drawingPolyline.getLatLngs().map(ll => [ll.lat, ll.lng]);
+  
+  // 1. Hitung total panjang kabel dalam meter
+  const distanceMeters = calculatePolylineLengthMeters(latlngs);
+  
+  // 2. Cari data pelanggan yang sedang diedit untuk tahu terhubung ke ODP mana
+  const customer = customers.find(c => c.id === currentEditingCustomer);
+  if (!customer || !customer.odp_id) {
+    alert('Pelanggan ini belum dihubungkan ke ODP manapun!');
+    return;
   }
+
+  try {
+    // 3. Panggil API Hitung Redaman (Link Budget)
+    const budgetRes = await fetch('/admin/api/odps/calculate-budget', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ odpId: customer.odp_id, distanceMeters })
+    });
+    const budgetData = await budgetRes.json();
+    
+    let warningMsg = '';
+    if (budgetData.ok && budgetData.budget) {
+      const b = budgetData.budget;
+      warningMsg = `\n\nEstimasi Redaman:\n- Panjang Kabel: ${distanceMeters} meter\n- Total Loss: ${b.totalLoss} dB\n- Sisa Daya Akhir (Rx): ${b.finalPowerDbm} dBm\n- Status: ${b.status}`;
+      
+      if (b.status === 'CRITICAL_LOS') {
+        warningMsg += '\n\n⚠️ PERINGATAN: Redaman terlalu tinggi! Berisiko LOS (Loss of Signal).';
+      }
+    }
+
+    // 4. Kirim request untuk menyimpan jalur kabel ke server
+    const pathJson = JSON.stringify(latlngs);
+    const res = await fetch(`/admin/api/customers/${currentEditingCustomer}/cable-path`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ path: pathJson })
+    });
+    
+    const data = await res.json();
+    if (data.ok) {
+      alert('Jalur kabel berhasil disimpan!' + warningMsg);
+      location.reload();
+    } else {
+      alert('Gagal menyimpan: ' + data.error);
+    }
+  } catch (e) {
+    alert('Error: ' + e.message);
+  }
+}
 
   // ODP Modal Pickers
   let pickerMap, pickerMarker;
@@ -1719,14 +2151,48 @@
   function closeModal(id) { document.getElementById(id).style.display = 'none'; }
 
   function editOdp(odp) {
-    document.getElementById('editOdpForm').action = '/admin/odps/' + odp.id + '/update';
-    document.getElementById('e_odp_name').value = odp.name;
-    document.getElementById('e_odp_lat').value = odp.lat;
-    document.getElementById('e_odp_lng').value = odp.lng;
-    document.getElementById('e_odp_description').value = odp.description || '';
-    openModal('editOdpModal');
-    initEditPickerMap(odp.lat, odp.lng);
+  document.getElementById('editOdpForm').action = '/admin/odps/' + odp.id + '/update';
+  document.getElementById('e_odp_name').value = odp.name;
+  document.getElementById('e_odp_lat').value = odp.lat;
+  document.getElementById('e_odp_lng').value = odp.lng;
+  document.getElementById('e_odp_description').value = odp.description || '';
+  
+  if(document.getElementById('e_odp_input_power')) {
+  document.getElementById('e_odp_input_power').value = odp.input_power_dbm;
+  document.getElementById('e_odp_input_power').removeAttribute('readonly');
+  document.getElementById('e_odp_input_power').style.background = '#ffffff';
+  const chk = document.getElementById('manual_override_dbm');
+  if(chk) chk.checked = true;
+}
+  
+  // -- [KODE BARU: MENGISI FIELD ODP TAMBAHAN] --
+  if(document.getElementById('e_odp_parent')) document.getElementById('e_odp_parent').value = odp.parent_odp_id || '';
+  if(document.getElementById('e_odp_splitter_type')) document.getElementById('e_odp_splitter_type').value = odp.splitter_type || 'PLC';
+  if(document.getElementById('e_odp_splitter_ratio')) document.getElementById('e_odp_splitter_ratio').value = odp.splitter_ratio || '1:8';
+  if(document.getElementById('e_odp_input_power')) document.getElementById('e_odp_input_power').value = odp.input_power_dbm || -9.0;
+  // ------------------------------------------
+// Render ulang baris splitter sesuai data database ODP ini jika ada multi-splitter
+  const container = document.getElementById('splitter-container');
+  if (container) {
+    container.innerHTML = '';
+    if (odp.splitters && odp.splitters.length > 0) {
+      odp.splitters.forEach(s => {
+        addSplitterRow(s.splitter_type, s.splitter_ratio);
+      });
+    } else {
+      // Fallback jika data splitter lama berupa single field
+      addSplitterRow(odp.splitter_type || 'PLC', odp.splitter_ratio || '1:8');
+    }
   }
+
+  // 👈 Render visualisasi port interaktif secara otomatis saat modal edit dibuka
+  if (typeof renderPortAllocationUI === 'function') {
+    renderPortAllocationUI(odp.ports || []);
+  }
+
+  openModal('editOdpModal');
+  initEditPickerMap(odp.lat, odp.lng);
+}
 
   function deleteOdpFromBtn(btn) {
     if (!btn || !btn.dataset) return;
@@ -1767,6 +2233,7 @@
   };
 
   // ─── REALTIME SPARKLINE CHART ─────────────────────────────────────────────
+  // ─── REALTIME SPARKLINE CHART (LIVE SPEED MBPS) ───────────────────────────
   const customerTrafficIntervals = {};
   const customerTrafficSeries = {};
 
@@ -1776,8 +2243,8 @@
     if (!ctx) return;
     const w = canvas.width;
     const h = canvas.height;
-    const padX = 6;
-    const padY = 6;
+    const padX = 4;
+    const padY = 4;
     const innerW = w - padX * 2;
     const innerH = h - padY * 2;
     const max = Number.isFinite(maxMbps) && maxMbps > 0 ? maxMbps : 10;
@@ -1785,6 +2252,7 @@
 
     ctx.clearRect(0, 0, w, h);
 
+    // Garis latar belakang tipis
     ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -1839,9 +2307,38 @@
     else el.classList.remove('on');
   }
 
-  function updatePopupTraffic(customerId, dlMbps, ulMbps, labelOverride) {
+  // Format kecepatan Mbps (jika di bawah 1 Mbps tampilkan dalam Kbps)
+  function formatMbps(mbps) {
+    const m = Number(mbps || 0);
+    if (m <= 0) return '0.00 Mbps';
+    if (m < 1) {
+      return (m * 1024).toFixed(1) + ' Kbps';
+    }
+    return m.toFixed(2) + ' Mbps';
+  }
+
+  // Fungsi konversi byte otomatis (Bytes ke KB, MB, GB, TB)
+  function formatBytes(bytes) {
+    const b = Number(bytes || 0);
+    if (b <= 0) return '0 MB';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(b) / Math.log(k));
+    return parseFloat((b / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  }
+
+  // --- [KODE PERBAIKAN: MENYESUAIKAN ARGUMEN JAVASCRIPT] ---
+  function updatePopupTrafficLive(customerId, totalRxBytes, totalTxBytes, rxMbps, txMbps, labelOverride) {
     const dlCanvas = document.getElementById(`cust_${customerId}_dl_chart`);
     const ulCanvas = document.getElementById(`cust_${customerId}_ul_chart`);
+    
+    const dlValEl = document.getElementById(`cust_${customerId}_dl_val`);
+    const ulValEl = document.getElementById(`cust_${customerId}_ul_val`);
+    
+    // Elemen Total Harian
+    const dailyDlEl = document.getElementById(`cust_${customerId}_daily_dl`);
+    const dailyUlEl = document.getElementById(`cust_${customerId}_daily_ul`);
+
     const dlMax = Number(dlCanvas && dlCanvas.dataset ? dlCanvas.dataset.max : 10) || 10;
     const ulMax = Number(ulCanvas && ulCanvas.dataset ? ulCanvas.dataset.max : 10) || 10;
 
@@ -1851,6 +2348,10 @@
     if (labelOverride) {
       setOverlay(customerId, 'dl', labelOverride);
       setOverlay(customerId, 'ul', labelOverride);
+      if (dlValEl) dlValEl.textContent = '-';
+      if (ulValEl) ulValEl.textContent = '-';
+      if (dailyDlEl) dailyDlEl.textContent = '-';
+      if (dailyUlEl) dailyUlEl.textContent = '-';
       st.dl = [];
       st.ul = [];
       drawSparkline(dlCanvas, [0, 0], dlMax, 'rgba(59,130,246,0.6)');
@@ -1861,50 +2362,62 @@
     setOverlay(customerId, 'dl', '');
     setOverlay(customerId, 'ul', '');
 
-    const dl = Math.max(0, Number(dlMbps || 0) || 0);
-    const ul = Math.max(0, Number(ulMbps || 0) || 0);
-    st.dl.push(dl);
-    st.ul.push(ul);
-    if (st.dl.length > 22) st.dl = st.dl.slice(-22);
-    if (st.ul.length > 22) st.ul = st.ul.slice(-22);
+    // 1. Tampilkan Total Akumulasi Harian (Download & Upload)
+    if (dailyDlEl) dailyDlEl.textContent = formatBytes(totalRxBytes);
+    if (dailyUlEl) dailyUlEl.textContent = formatBytes(totalTxBytes);
+
+    // 2. Tampilkan Grafik Realtime Mbps di bawahnya
+    const dlSpeed = Math.max(0, Number(rxMbps || 0) || 0);
+    const ulSpeed = Math.max(0, Number(txMbps || 0) || 0);
+
+    if (dlValEl) dlValEl.textContent = formatMbps(dlSpeed);
+    if (ulValEl) ulValEl.textContent = formatMbps(ulSpeed);
+
+    st.dl.push(dlSpeed);
+    st.ul.push(ulSpeed);
+    if (st.dl.length > 20) st.dl = st.dl.slice(-20);
+    if (st.ul.length > 20) st.ul = st.ul.slice(-20);
 
     drawSparkline(dlCanvas, st.dl, dlMax, '#3b82f6');
     drawSparkline(ulCanvas, st.ul, ulMax, '#22c55e');
   }
 
+  // === [PERBAIKAN: PASTIKAN POP-UP MAP MENGAMBIL TOTAL HARIAN (DAILY)] ===
   async function refreshCustomerTrafficPopup(customerId) {
     try {
       const r = await fetch(`/admin/api/customers/${customerId}/pppoe-traffic`, { cache: 'no-store' });
       const data = await r.json();
       if (!data || !data.ok) {
-        updatePopupTraffic(customerId, 0, 0, '-');
+        updatePopupTrafficLive(customerId, 0, 0, 0, 0, 'Error');
         return;
       }
       if (!data.available) {
-        updatePopupTraffic(customerId, 0, 0, 'N/A');
+        updatePopupTrafficLive(customerId, 0, 0, 0, 0, 'N/A');
         return;
       }
       if (!data.online) {
-        updatePopupTraffic(customerId, 0, 0, 'Offline');
-        return;
-      }
-      if (data.warmup) {
-        updatePopupTraffic(customerId, 0, 0, 'Mengukur');
+        updatePopupTrafficLive(customerId, 0, 0, 0, 0, 'Offline');
         return;
       }
 
-      const rx = Number(data.rxMbps || 0);
-      const tx = Number(data.txMbps || 0);
-      updatePopupTraffic(customerId, tx, rx, '');
-    } catch {
-      updatePopupTraffic(customerId, 0, 0, '-');
+      // Mengambil data HARIAN (dailyRxBytes & dailyTxBytes) untuk Peta
+      const totalDownloadBytes = Number(data.dailyRxBytes || 0); // Download Harian
+      const totalUploadBytes = Number(data.dailyTxBytes || 0);   // Upload Harian
+      const downloadSpeed = Number(data.rxMbps || 0);            // Live DL Mbps
+      const uploadSpeed = Number(data.txMbps || 0);              // Live UL Mbps
+
+      updatePopupTrafficLive(customerId, totalDownloadBytes, totalUploadBytes, downloadSpeed, uploadSpeed, '');
+    } catch (err) {
+      updatePopupTrafficLive(customerId, 0, 0, 0, 0, 'Offline');
     }
   }
+  // =====================================================================
+
 
   function startCustomerTrafficPopup(customerId) {
     stopCustomerTrafficPopup(customerId);
     refreshCustomerTrafficPopup(customerId);
-    customerTrafficIntervals[customerId] = setInterval(() => refreshCustomerTrafficPopup(customerId), 3000);
+    customerTrafficIntervals[customerId] = setInterval(() => refreshCustomerTrafficPopup(customerId), 2000); // Refresh tiap 2 detik
   }
 
   function stopCustomerTrafficPopup(customerId) {
@@ -1929,6 +2442,36 @@
     if (!to) return 'javascript:void(0)';
     return `https://wa.me/${to}?text=${encodeURIComponent(msg)}`;
   }
+  
+// --- BACKGROUND TRAFFIC POLLER FOR ALL MAP CUSTOMERS ---
+function initBackgroundTrafficSync() {
+  setInterval(async () => {
+    // Ambil semua ID pelanggan yang memiliki koordinat GPS dan status aktif di peta
+    const activeCustomerIds = Object.keys(customerMap);
+    if (activeCustomerIds.length === 0) return;
+
+    // Lakukan fetch secara bergiliran atau batch agar tidak membebani server/router
+    for (const custId of activeCustomerIds) {
+      // Jika pop-up pelanggan ini sedang terbuka, biarkan interval pop-up yang handle (lewati agar tidak bentrok)
+      if (customerTrafficIntervals[custId]) continue; 
+
+      try {
+        // Hitung background diam-diam ke server agar database ter-update terus menerus
+        await fetch(`/admin/api/customers/${custId}/pppoe-traffic`, { cache: 'no-store' });
+      } catch (e) {
+        // Abaikan error jaringan sesaat
+      }
+      // Beri jeda kecil antar request agar router MikroTik tidak kewalahan
+      await new Promise(r => setTimeout(r, 1000));
+    }
+  }, 30000); // Berjalan otomatis setiap 30 detik di background
+}
+
+// Jalankan setelah peta selesai dimuat
+setTimeout(() => {
+  initBackgroundTrafficSync();
+}, 5000);
+
 </script>
 </body>
 </html>
