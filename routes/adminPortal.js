@@ -675,12 +675,19 @@ router.post('/olts/:id/onu/:index/rename', requireAdminSession, restrictToAdmin,
   }
 });
 
+// authorize onu
 router.post('/olts/:id/onu/authorize', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), async (req, res) => {
   try {
-    const output = await oltSvc.authorizeOnu(req.params.id, req.body);
-    res.json({ success: true, message: 'Otorisasi berhasil.', output });
+    // Parameter yang dikirim dari form atau JSON
+    const { index, sn, name } = req.body; 
+    
+    // Gunakan service baru yang 100% SNMP
+    const result = await oltSvc.authorizeOnuBySnmp(req.params.id, { index, sn, name });
+    
+    res.json({ success: true, message: result.message, data: result.data });
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    logger.error('[Authorize] Error:', e);
+    res.status(400).json({ success: false, error: e.message });
   }
 });
 
@@ -759,157 +766,191 @@ router.get('/api/customers/live-sessions', requireAdminSession, async (req, res)
   }
 });
 
+//TRAFIK PEMAKAIAN DI MAPING
+
+// === [KODE FINAL: LIVE THROUGHPUT RESPONSIF + AKUMULASI BULANAN PERSISTEN] ===
 router.get('/api/customers/:id/pppoe-traffic', requireAdminSession, async (req, res) => {
   const customerId = Number(req.params.id);
-  if (!customerId) return res.status(400).json({ ok: false, error: 'invalid_customer' });
+  if (!customerId) return res.json({ ok: false, error: 'invalid_customer' });
 
   const customer = customerSvc.getCustomerById(customerId);
-  if (!customer) return res.status(404).json({ ok: false, error: 'not_found' });
+  if (!customer) return res.json({ ok: false, error: 'not_found' });
 
-  const routerId = customer.router_id ? Number(customer.router_id) : null;
+  let routerId = customer.router_id ? Number(customer.router_id) : null;
+  if (!routerId || routerId <= 0) {
+    const defaultRouter = mikrotikService.getAllRouters()?.[0];
+    routerId = defaultRouter ? defaultRouter.id : null;
+  }
+
   const username = String(customer.pppoe_username || '').trim();
-
-  if (!routerId || !username) {
-    return res.json({ ok: true, available: false, online: false, username: username || null, rxMbps: 0, txMbps: 0 });
+  if (!username) {
+    const dbCust = db.prepare('SELECT bytes_in, bytes_out, bytes_in_daily, bytes_out_daily FROM customers WHERE id = ?').get(customerId);
+    return res.json({ 
+      ok: true, available: false, online: false, username: null, 
+      dailyRxBytes: dbCust?.bytes_in_daily || 0, dailyTxBytes: dbCust?.bytes_out_daily || 0,
+      monthlyRxBytes: dbCust?.bytes_in || 0, monthlyTxBytes: dbCust?.bytes_out || 0,
+      rxMbps: 0, txMbps: 0 
+    });
   }
 
   const now = Date.now();
   prunePppoeTrafficSamples(now);
+  const key = `${routerId || 'default'}_${username}`;
+  const prev = pppoeTrafficSamples.get(key);
 
   let conn = null;
   try {
-    conn = await mikrotikService.getConnection(routerId);
-    const sessions = await conn.client.menu('/ppp/active').where('name', username).get();
-    if (!sessions || sessions.length === 0) {
-      return res.json({ ok: true, available: true, online: false, username, rxMbps: 0, txMbps: 0 });
-    }
+    conn = routerId ? await mikrotikService.getConnection(routerId) : await mikrotikService.getConnection();
+    
+    let isOnline = false;
+    let rawDownloadBytes = 0; // tx-byte (Router -> Pelanggan)
+    let rawUploadBytes = 0;   // rx-byte (Pelanggan -> Router)
+    let sessionId = username;
 
-    const s = sessions[0];
-    let iface = strField(s, ['interface', 'interface-name', 'interfaceName', 'ifname', 'if-name', 'pppInterface']) || null;
-    const baseSessionId = strField(s, ['.id', 'id', 'sessionId', 'session-id']) || `${username}`;
-    const bytesIn = numField(s, ['bytesIn', 'bytes-in', 'bytes_in']);
-    const bytesOut = numField(s, ['bytesOut', 'bytes-out', 'bytes_out']);
-    const uptime = strField(s, ['uptime']) || null;
+    if (conn && conn.client) {
+      const activeSessions = await conn.client.menu('/ppp/active').where('name', username).get().catch(() => []);
+      if (activeSessions && activeSessions.length > 0) {
+        isOnline = true;
+        sessionId = strField(activeSessions[0], ['.id', 'id']) || username;
+      }
 
-    if (!iface) {
+      let interfaces = [];
       try {
-        const pppoeSrvMenu = conn.client.menu('/interface/pppoe-server');
-        let pppoeRows = [];
-        try {
-          pppoeRows = await pppoeSrvMenu.where('user', username).get();
-        } catch {
-          pppoeRows = await pppoeSrvMenu.get();
-        }
-        const hit = (Array.isArray(pppoeRows) ? pppoeRows : []).find(r => String(r.user || r['user'] || '').trim() === username);
-        const ifaceName = strField(hit, ['name']);
-        if (ifaceName) iface = ifaceName;
+        interfaces = await conn.client.menu('/interface').where('name', `<pppoe-${username}>`).get();
       } catch {}
-    }
 
-    const sessionId = `${baseSessionId}${iface ? `|${iface}` : ''}`;
-
-    const key = `${routerId || 'default'}:${username}`;
-    const prev = pppoeTrafficSamples.get(key);
-    let rxBytes = bytesIn;
-    let txBytes = bytesOut;
-    let source = 'ppp-active';
-
-    if (iface) {
-      const ifMenu = conn.client.menu('/interface');
-      if (ifMenu) {
+      if (!interfaces || interfaces.length === 0) {
         try {
-          const mtRaw = await invokeRouterOsMenuCommand(ifMenu, 'monitor-traffic', { interface: iface, once: '' });
-          const mt = Array.isArray(mtRaw) ? mtRaw[0] : mtRaw;
-          const rxBps = numField(mt, ['rxBitsPerSecond', 'rx-bits-per-second', 'rx-bits-per-second']);
-          const txBps = numField(mt, ['txBitsPerSecond', 'tx-bits-per-second', 'tx-bits-per-second']);
-          if (rxBps || txBps) {
-            return res.json({
-              ok: true,
-              available: true,
-              online: true,
-              username,
-              iface,
-              source: 'monitor-traffic',
-              uptime,
-              rxMbps: (Number(rxBps) || 0) / 1e6,
-              txMbps: (Number(txBps) || 0) / 1e6
-            });
-          }
+          interfaces = await conn.client.menu('/interface').where('name', username).get();
         } catch {}
+      }
+      if (!interfaces || interfaces.length === 0) {
+        try {
+          interfaces = await conn.client.menu('/interface').get();
+          interfaces = (interfaces || []).filter(iface => String(iface.name || '').toLowerCase().includes(username.toLowerCase()));
+        } catch {}
+      }
+
+      if (interfaces && interfaces.length > 0) {
+        isOnline = true;
+        const iface = interfaces[0];
+        
+        // JANGAN DIBALIK:
+        // tx-byte = Download (Router ke Pelanggan) -> Masuk ke bytes_in
+        // rx-byte = Upload (Klien ke Router) -> Masuk ke bytes_out
+        rawDownloadBytes = numField(iface, ['tx-byte', 'txBytes', 'bytes-out', 'bytesOut']); 
+        rawUploadBytes   = numField(iface, ['rx-byte', 'rxBytes', 'bytes-in', 'bytesIn']);   
       }
     }
 
-    if (iface) {
-      try {
-        const ifRows = await conn.client.menu('/interface').where('name', iface).get();
-        if (ifRows && ifRows.length > 0) {
-          const row = ifRows[0];
-          const ifRx = numField(row, ['rxByte', 'rx-byte', 'rx-bytes', 'rxBytes']);
-          const ifTx = numField(row, ['txByte', 'tx-byte', 'tx-bytes', 'txBytes']);
-          if (ifRx || ifTx) {
-            rxBytes = ifRx;
-            txBytes = ifTx;
-            source = 'interface';
-          }
-        }
-      } catch {}
-    }
-
-    pppoeTrafficSamples.set(key, { t: now, sessionId, rxBytes, txBytes, source });
-
-    if (!prev || prev.sessionId !== sessionId || !prev.t) {
-      return res.json({
-        ok: true,
-        available: true,
-        online: true,
-        warmup: true,
-        username,
-        iface,
-        source,
-        uptime,
-        rxMbps: 0,
-        txMbps: 0
+    if (!isOnline) {
+      pppoeTrafficSamples.delete(key);
+      const dbCust = db.prepare('SELECT bytes_in, bytes_out, bytes_in_daily, bytes_out_daily FROM customers WHERE id = ?').get(customerId);
+      return res.json({ 
+        ok: true, available: true, online: false, username, 
+        dailyRxBytes: dbCust?.bytes_in_daily || 0, dailyTxBytes: dbCust?.bytes_out_daily || 0,
+        monthlyRxBytes: dbCust?.bytes_in || 0, monthlyTxBytes: dbCust?.bytes_out || 0,
+        rxMbps: 0, txMbps: 0 
       });
     }
 
-    const dtMs = Math.max(1, now - prev.t);
-    const dIn = rxBytes - numField(prev, ['rxBytes']);
-    const dOut = txBytes - numField(prev, ['txBytes']);
-    if (dIn < 0 || dOut < 0) {
-      return res.json({
-        ok: true,
-        available: true,
-        online: true,
-        warmup: true,
-        username,
-        iface,
-        source,
-        uptime,
-        rxMbps: 0,
-        txMbps: 0
-      });
+    let deltaDownload = 0;
+    let deltaUpload = 0;
+
+    if (prev && prev.sessionId === sessionId) {
+      // Proteksi jika counter MikroTik mendadak reset (reboot)
+      if (rawDownloadBytes >= prev.rawDownload) {
+        deltaDownload = rawDownloadBytes - prev.rawDownload;
+      } else {
+        deltaDownload = rawDownloadBytes;
+      }
+
+      if (rawUploadBytes >= prev.rawUpload) {
+        deltaUpload = rawUploadBytes - prev.rawUpload;
+      } else {
+        deltaUpload = rawUploadBytes;
+      }
+    } else {
+      deltaDownload = 0;
+      deltaUpload = 0;
     }
 
-    const rxMbps = (dIn * 8) / (dtMs / 1000) / 1e6;
-    const txMbps = (dOut * 8) / (dtMs / 1000) / 1e6;
+    // Simpan state counter saat ini untuk perhitungan speed/delta berikutnya
+    pppoeTrafficSamples.set(key, { sessionId, rawDownload: rawDownloadBytes, rawUpload: rawUploadBytes, t: now });
+
+    let downloadMbps = 0;
+    let uploadMbps = 0;
+    if (prev && prev.t) {
+      const dtSec = Math.max(1, (now - prev.t) / 1000);
+      downloadMbps = Number(((deltaDownload * 8) / dtSec / 1000000).toFixed(3));
+      uploadMbps = Number(((deltaUpload * 8) / dtSec / 1000000).toFixed(3));
+    }
+
+    // Ambil data dari database untuk diakumulasikan
+    const dbCust = db.prepare('SELECT bytes_in, bytes_out, bytes_in_daily, bytes_out_daily FROM customers WHERE id = ?').get(customerId);
+    const currentBytesIn = Number(dbCust?.bytes_in || 0);
+    const currentBytesOut = Number(dbCust?.bytes_out || 0);
+    const currentDailyIn = Number(dbCust?.bytes_in_daily || 0);
+    const currentDailyOut = Number(dbCust?.bytes_out_daily || 0);
+
+    // Update akumulasi secara persisten ke database jika ada tambahan delta byte
+    if (deltaDownload > 0 || deltaUpload > 0) {
+      db.prepare(`
+        UPDATE customers 
+        SET bytes_in_daily = ?,  
+            bytes_out_daily = ?,
+            bytes_in = ?,              
+            bytes_out = ?              
+        WHERE id = ?
+      `).run(
+        currentDailyIn + deltaDownload,
+        currentDailyOut + deltaUpload,
+        currentBytesIn + deltaDownload,   // Akumulasi Download Bulanan (bytes_in) terus bertambah
+        currentBytesOut + deltaUpload,  // Akumulasi Upload Bulanan (bytes_out) terus bertambah
+        customerId
+      );
+    }
+
+    const updatedCust = db.prepare('SELECT bytes_in, bytes_out, bytes_in_daily, bytes_out_daily FROM customers WHERE id = ?').get(customerId);
 
     return res.json({
       ok: true,
       available: true,
-      online: true,
+      online: isOnline,
       username,
-      iface,
-      source,
-      uptime,
-      rxMbps: Number.isFinite(rxMbps) ? rxMbps : 0,
-      txMbps: Number.isFinite(txMbps) ? txMbps : 0
+      dailyRxBytes: updatedCust?.bytes_in_daily || (currentDailyIn + deltaDownload),   
+      dailyTxBytes: updatedCust?.bytes_out_daily || (currentDailyOut + deltaUpload), 
+      monthlyRxBytes: updatedCust?.bytes_in || (currentBytesIn + deltaDownload),       
+      monthlyTxBytes: updatedCust?.bytes_out || (currentBytesOut + deltaUpload),      
+      rxMbps: Number.isFinite(downloadMbps) ? downloadMbps : 0, 
+      txMbps: Number.isFinite(uploadMbps) ? uploadMbps : 0     
     });
+
   } catch (e) {
-    return res.json({ ok: false, error: e.message || 'failed' });
+    const dbCust = db.prepare('SELECT bytes_in, bytes_out, bytes_in_daily, bytes_out_daily FROM customers WHERE id = ?').get(customerId);
+    return res.json({ 
+      ok: true, available: true, online: false, 
+      dailyRxBytes: dbCust?.bytes_in_daily || 0, dailyTxBytes: dbCust?.bytes_out_daily || 0,
+      monthlyRxBytes: dbCust?.bytes_in || 0, monthlyTxBytes: dbCust?.bytes_out || 0,
+      rxMbps: 0, txMbps: 0 
+    });
   } finally {
-    if (conn && conn.api) conn.api.close();
+    if (conn && conn.api) { try { conn.api.close(); } catch {} }
   }
 });
+// === [AKHIR KODE TRAFIK] ===
+
+// Scheduler: Mereset trafik harian jam 23:59 untuk kebutuhan Peta
+const cron = require('node-cron');
+cron.schedule('59 23 * * *', () => {
+  try {
+    db.prepare(`UPDATE customers SET bytes_in_daily = 0, bytes_out_daily = 0`).run();
+    logger.info('[Scheduler] Berhasil mereset trafik harian (bytes_in_daily & bytes_out_daily) ke 0.');
+  } catch (e) {
+    logger.error('[Scheduler] Gagal mereset trafik harian: ' + e.message);
+  }
+});
+
 
 router.post('/api/customers/:id/cable-path', requireAdminSession, (req, res) => {
   try {
@@ -953,6 +994,39 @@ router.post('/odps/:id/delete', requireAdminSession, restrictToAdmin, (req, res)
   }
   res.redirect('/admin/map');
 });
+
+// --- [KODE BARU: API HITUNG REDAMAN JALUR KABEL KE ODP/PELANGGAN] ---
+const { calculateLinkBudget } = require('../utils/opticCalculator'); // Sesuaikan path jika letak file opticCalculator.js berbeda
+
+router.post('/api/odps/calculate-budget', requireAdminSession, express.json(), (req, res) => {
+  try {
+    const { odpId, distanceMeters, customInputDbm } = req.body;
+    
+    if (!odpId) throw new Error('ODP ID wajib disertakan');
+
+    // Ambil data ODP dari database
+    const odp = odpSvc.getOdpById(odpId);
+    if (!odp) throw new Error('Data ODP tidak ditemukan');
+
+    // Tentukan redaman masukan (input power). 
+    // Jika ODP ini punya parent (ODP anak), idealnya input power mengikuti sisa redaman ODP induk.
+    // Untuk saat ini, kita gunakan input_power_dbm milik ODP tersebut atau custom dari request.
+    let inputPower = customInputDbm !== undefined ? parseFloat(customInputDbm) : parseFloat(odp.input_power_dbm || -9.0);
+
+    // Hitung menggunakan helper optik
+    const result = calculateLinkBudget(
+      inputPower,
+      parseFloat(distanceMeters || 0),
+      odp.splitter_type || 'PLC',
+      odp.splitter_ratio || '1:8'
+    );
+
+    res.json({ ok: true, budget: result, odpName: odp.name });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+// ------------------------------------------------------------------
 
 // --- TECHNICIAN MANAGEMENT ---
 router.get('/technicians', requireAdminSession, requireSidebarMenuAccess('technicians'), restrictToAdmin, (req, res) => {
@@ -1798,9 +1872,31 @@ router.get('/customers/:id/sticker-onu', requireAdminSession, async (req, res) =
 
 // ─── CUSTOMERS ─────────────────────────────────────────────────────────────
 router.get('/customers', requireAdminSession, requireSidebarMenuAccess('customers'), async (req, res) => {
-  const { search = '', status: filterStatus = '', area: filterArea = '' } = req.query;
+  const { search = '', status: filterStatus = '', area: filterArea = '', open_detail_id = '' } = req.query;
   const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
-  const customers = customerSvc.getAllCustomers(search, selectedRouterId, filterStatus, filterArea);
+  
+  let customers = customerSvc.getAllCustomers(search, selectedRouterId, filterStatus, filterArea);
+  
+  // --- [KODE BARU: PASTIKAN BYTES_IN & BYTES_OUT SELALU READY DI SERVER] ---
+  customers = customers.map(c => {
+    const usage = db.prepare('SELECT bytes_in, bytes_out FROM customers WHERE id = ?').get(c.id);
+    return {
+      ...c,
+      bytes_in: usage ? (usage.bytes_in || 0) : (c.bytes_in || 0),
+      bytes_out: usage ? (usage.bytes_out || 0) : (c.bytes_out || 0)
+    };
+  });
+  // ----------------------------------------------------------------------
+
+  if (open_detail_id && !search && !filterStatus && !filterArea) {
+    const targetIdNum = Number(open_detail_id);
+    const exists = customers.some(c => Number(c.id) === targetIdNum);
+    if (!exists) {
+      const specificCust = customerSvc.getCustomerById(targetIdNum);
+      if (specificCust) customers.unshift(specificCust);
+    }
+  }
+
   const stats = customerSvc.getCustomerStats();
   const packages = customerSvc.getAllPackages(selectedRouterId);
   const routers = mikrotikService.getAllRouters();
@@ -2741,6 +2837,140 @@ router.post('/api/vouchers/packages/:id/delete', requireAdminSession, (req, res)
   }
 });
 
+// ─── VOUCHER ONLINE TRANSACTIONS (PUBLIC VOUCHER ORDERS) ───────────────────
+router.get('/vouchers/orders', requireAdminSession, requireSidebarMenuAccess('voucher_packages'), (req, res) => {
+  const selectedRouterId = req.selectedRouterId || (req.query.router_id ? Number(req.query.router_id) : null);
+  const routers = db.prepare('SELECT id, name FROM routers WHERE is_active = 1').all();
+  res.render('admin/vouchers_orders', {
+    title: 'Riwayat Transaksi Voucher Online',
+    company: company(),
+    activePage: 'voucher_packages',
+    routers,
+    selectedRouterId,
+    msg: flashMsg(req)
+  });
+});
+
+router.get('/api/vouchers/orders', requireAdminSession, (req, res) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page) || 1);
+    const limit = Math.max(1, Math.min(100, parseInt(req.query.limit) || 20));
+    const offset = (page - 1) * limit;
+    const status = String(req.query.status || '').trim();
+    const routerId = req.query.router_id ? Number(req.query.router_id) : null;
+    const q = String(req.query.q || '').trim();
+
+    const where = [];
+    const params = [];
+
+    if (status) {
+      where.push('pvo.status = ?');
+      params.push(status);
+    }
+    if (routerId && routerId > 0) {
+      where.push('pvo.router_id = ?');
+      params.push(routerId);
+    }
+    if (q) {
+      where.push('(pvo.voucher_code LIKE ? OR pvo.buyer_phone LIKE ? OR pvo.profile_name LIKE ? OR CAST(pvo.id AS TEXT) LIKE ?)');
+      params.push(`%${q}%`, `%${q}%`, `%${q}%`, `%${q}%`);
+    }
+
+    const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+
+    // Summary statistics
+    const statsRow = db.prepare(`
+      SELECT 
+        COUNT(*) as total_orders,
+        SUM(CASE WHEN status IN ('paid', 'fulfilled') THEN price ELSE 0 END) as total_revenue,
+        SUM(CASE WHEN status = 'fulfilled' THEN 1 ELSE 0 END) as fulfilled_count,
+        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending_count,
+        SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END) as expired_count
+      FROM public_voucher_orders
+    `).get();
+
+    // Total count for current filter
+    const totalCount = db.prepare(`
+      SELECT COUNT(*) as cnt 
+      FROM public_voucher_orders pvo
+      ${whereSql}
+    `).get(...params).cnt;
+
+    // Paginated list
+    const rows = db.prepare(`
+      SELECT pvo.*, r.name as router_name
+      FROM public_voucher_orders pvo
+      LEFT JOIN routers r ON r.id = pvo.router_id
+      ${whereSql}
+      ORDER BY pvo.id DESC
+      LIMIT ? OFFSET ?
+    `).all(...params, limit, offset);
+
+    // Format dates to local
+    const formattedRows = rows.map(r => {
+      const displayDate = r.paid_at || r.created_at;
+      return {
+        ...r,
+        created_at: r.created_at ? formatDateLocal(r.created_at, 'YYYY-MM-DD HH:mm:ss') : null,
+        paid_at: r.paid_at ? formatDateLocal(r.paid_at, 'YYYY-MM-DD HH:mm:ss') : null,
+        fulfilled_at: r.fulfilled_at ? formatDateLocal(r.fulfilled_at, 'YYYY-MM-DD HH:mm:ss') : null,
+        time_ago: displayDate ? formatDateLocal(displayDate, 'DD MMM YYYY, HH:mm') : '-'
+      };
+    });
+
+    res.json({
+      ok: true,
+      rows: formattedRows,
+      stats: statsRow || {},
+      pagination: {
+        page,
+        limit,
+        total: totalCount,
+        totalPages: Math.ceil(totalCount / limit) || 1
+      }
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+router.post('/api/vouchers/orders/:id/resend-wa', requireAdminSession, async (req, res) => {
+  try {
+    const orderId = Number(req.params.id);
+    const order = db.prepare('SELECT * FROM public_voucher_orders WHERE id = ?').get(orderId);
+    if (!order) return res.status(404).json({ ok: false, error: 'Pesanan voucher tidak ditemukan' });
+    if (!order.buyer_phone) return res.status(400).json({ ok: false, error: 'Nomor WhatsApp pembeli tidak tercatat' });
+    if (!order.voucher_code) return res.status(400).json({ ok: false, error: 'Kode voucher belum digenerate untuk pesanan ini' });
+
+    const { sendWA, whatsappStatus } = await import('../services/whatsappBot.mjs');
+    if (whatsappStatus.connection !== 'open') {
+      return res.status(400).json({ ok: false, error: 'Bot WhatsApp sedang tidak terhubung' });
+    }
+
+    const gateway = (order.payment_gateway || 'QRIS').toUpperCase();
+    const msg =
+      `🎫 *KIRIM ULANG VOUCHER HOTSPOT*\n\n` +
+      `✅ Pembayaran diterima via *${gateway}*\n` +
+      `📦 Paket: *${order.profile_name}* (${order.validity || '-'})\n` +
+      `💰 Harga: Rp ${Number(order.price || 0).toLocaleString('id-ID')}\n\n` +
+      `👤 User: *${order.voucher_code}*\n` +
+      `🔑 Pass: *${order.voucher_password || order.voucher_code}*\n\n` +
+      `Terima kasih telah menggunakan layanan kami.`;
+
+    await sendWA(order.buyer_phone, msg);
+
+    db.prepare(`
+      UPDATE public_voucher_orders
+      SET wa_sent = 1, wa_sent_at = (NOW_LOCAL()), wa_error = '', updated_at = (NOW_LOCAL())
+      WHERE id = ?
+    `).run(orderId);
+
+    res.json({ ok: true, message: 'Voucher berhasil dikirim ulang ke WhatsApp' });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ─── BILLING ───────────────────────────────────────────────────────────────
 router.get('/billing', requireAdminSession, requireSidebarMenuAccess('billing'), (req, res) => {
   const timeInfo = getCurrentTimeInfo();
@@ -2999,6 +3229,20 @@ router.post('/billing/:id/pay', requireAdminSession, express.urlencoded({ extend
       billingSvc.markAsPaid(req.params.id, paidBy, req.body.notes);
     }
     
+ // --- [AWAL PERUBAHAN]: RESET KUOTA KE 0 SAAT TAGIHAN DITANDAI LUNAS ---
+    if (!wasPaid) {
+      const targetCustId = Number(inv.customer_id);
+      if (Number.isFinite(targetCustId) && targetCustId > 0) {
+        // Reset byte pemakaian bulanan dan total ke 0
+        // === [AWAL KODE BARU: RESET BULANAN KETIKA TAGIHAN DITANDAI LUNAS] ===
+		db.prepare(`UPDATE customers SET bytes_in_monthly = 0, bytes_out_monthly = 0 WHERE id = ?`).run(targetCustId);
+// === [AKHIR KODE BARU] ===
+        db.prepare(`UPDATE customer_usage SET bytes_in = 0, bytes_out = 0 WHERE customer_id = ?`).run(targetCustId);
+        logger.info(`[Billing] Kuota pemakaian untuk customer_id ${targetCustId} telah di-reset ke 0 karena tagihan dilunasi.`);
+      }
+    }
+// --- [AKHIR PERUBAHAN]: RESET KUOTA KE 0 SAAT TAGIHAN DITANDAI LUNAS ---
+
     // Check if customer is currently suspended and has no more unpaid invoices
     const customer = customerSvc.getCustomerById(inv.customer_id);
     if (!wasPaid && customer && customer.phone) {
@@ -4256,6 +4500,10 @@ router.post('/settings', requireAdminSession, express.urlencoded({ extended: tru
     }
     newSettings.auto_backup_enabled = (newSettings.auto_backup_enabled === 'true');
     newSettings.use_builtin_acs = (newSettings.use_builtin_acs === 'true' || newSettings.use_builtin_acs === true);
+	newSettings.portal_banner_enabled = (newSettings.portal_banner_enabled === 'true' || newSettings.portal_banner_enabled === true);
+
+	// Tambahkan baris ini di dalam router.post('/settings') sebelum fungsi saveSettings(newSettings)
+	newSettings.bruteforce_auto_block_enabled = (newSettings.bruteforce_auto_block_enabled === 'true' || newSettings.bruteforce_auto_block_enabled === true);
 
     // AI Provider & API Settings
     if (newSettings.ai_provider) newSettings.ai_provider = String(newSettings.ai_provider).trim().toLowerCase();
@@ -4505,67 +4753,190 @@ router.post('/backup/cleanup', requireAdminSession, express.urlencoded({ extende
 
 // ─── INVENTORY / WAREHOUSE ──────────────────────────────────────────────────
 router.get('/inventory', requireAdminSession, requireSidebarMenuAccess('inventory'), (req, res) => {
-  const items = inventorySvc.getAllItems(req.query.q);
+  const selectedCat = req.query.category_id ? Number(req.query.category_id) : null;
+  const items = inventorySvc.getAllItems(req.query.q, selectedCat);
   const categories = inventorySvc.getAllCategories();
-  const logs = inventorySvc.getInventoryLogs(100);
+  const logs = inventorySvc.getInventoryLogs({
+    limit: 150,
+    search: req.query.log_q || '',
+    type: req.query.log_type || null,
+    itemId: req.query.log_item_id || null
+  });
+  const stats = inventorySvc.getInventoryStats();
+
+  let customers = [];
+  try {
+    customers = db.prepare('SELECT id, name, pppoe_username as pppoe_user, phone FROM customers ORDER BY name ASC').all() || [];
+  } catch (e) {
+    customers = [];
+  }
+
+  let technicians = [];
+  try {
+    technicians = db.prepare('SELECT id, name, phone FROM technicians WHERE is_active = 1 ORDER BY name ASC').all() || [];
+  } catch (e) {
+    technicians = [];
+  }
 
   res.render('admin/inventory', {
-    title: 'Manajemen Inventaris',
+    title: 'Manajemen Inventaris & Stok Gudang',
     company: company(),
     activePage: 'inventory',
     msg: flashMsg(req),
     items,
     categories,
-    logs
+    logs,
+    stats,
+    customers,
+    technicians,
+    query: req.query
   });
 });
 
+// JSON API Detail Barang untuk Modal & Kartu Stok
+router.get('/api/inventory/item/:id', requireAdminSession, (req, res) => {
+  try {
+    const detail = inventorySvc.getItemDetail(req.params.id);
+    if (!detail) return res.status(404).json({ success: false, message: 'Barang tidak ditemukan' });
+    res.json({ success: true, data: detail });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// JSON API List Serial Number Available untuk Dropdown Modal
+router.get('/api/inventory/serials/:itemId', requireAdminSession, (req, res) => {
+  try {
+    const serials = inventorySvc.getAvailableSerialNumbers(req.params.itemId);
+    res.json({ success: true, data: serials });
+  } catch (e) {
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// Kategori: Tambah
 router.post('/inventory/category/add', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
   try {
     inventorySvc.createCategory(req.body);
-    req.session._msg = { type: 'success', text: 'Kategori berhasil ditambahkan.' };
+    req.session._msg = { type: 'success', text: 'Kategori barang berhasil ditambahkan.' };
   } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+    req.session._msg = { type: 'error', text: 'Gagal menambah kategori: ' + e.message };
   }
-  res.redirect('/admin/inventory');
+  res.redirect('/admin/inventory?tab=categories');
 });
 
+// Kategori: Edit
+router.post('/inventory/category/edit/:id', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    inventorySvc.updateCategory(req.params.id, req.body);
+    req.session._msg = { type: 'success', text: 'Kategori barang berhasil diperbarui.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal memperbarui kategori: ' + e.message };
+  }
+  res.redirect('/admin/inventory?tab=categories');
+});
+
+// Kategori: Hapus
 router.post('/inventory/category/delete/:id', requireAdminSession, (req, res) => {
   try {
     inventorySvc.deleteCategory(req.params.id);
     req.session._msg = { type: 'success', text: 'Kategori berhasil dihapus.' };
   } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+    req.session._msg = { type: 'error', text: 'Gagal menghapus kategori: ' + e.message };
   }
-  res.redirect('/admin/inventory');
+  res.redirect('/admin/inventory?tab=categories');
 });
 
+// Master Barang: Tambah
 router.post('/inventory/item/add', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
   try {
     inventorySvc.createItem(req.body);
-    req.session._msg = { type: 'success', text: 'Barang berhasil ditambahkan.' };
+    req.session._msg = { type: 'success', text: 'Data barang baru berhasil disimpan.' };
   } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+    req.session._msg = { type: 'error', text: 'Gagal menambah barang: ' + e.message };
   }
   res.redirect('/admin/inventory');
 });
 
+// Master Barang: Edit
 router.post('/inventory/item/edit/:id', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
   try {
     inventorySvc.updateItem(req.params.id, req.body);
-    req.session._msg = { type: 'success', text: 'Barang berhasil diperbarui.' };
+    req.session._msg = { type: 'success', text: 'Data barang berhasil diperbarui.' };
   } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+    req.session._msg = { type: 'error', text: 'Gagal memperbarui barang: ' + e.message };
   }
   res.redirect('/admin/inventory');
 });
 
+// Master Barang: Hapus
+router.post('/inventory/item/delete/:id', requireAdminSession, (req, res) => {
+  try {
+    inventorySvc.deleteItem(req.params.id);
+    req.session._msg = { type: 'success', text: 'Data barang berhasil dihapus.' };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal menghapus barang: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+// Transaksi: 1. Stok Masuk (IN)
 router.post('/inventory/stock/add', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
   try {
-    inventorySvc.addStock(req.body, req.session.adminUser || 'Admin');
-    req.session._msg = { type: 'success', text: 'Stok berhasil ditambahkan.' };
+    const actor = req.session.adminUser || (req.session.user && req.session.user.name) || 'Admin';
+    const result = inventorySvc.addStock(req.body, actor);
+    req.session._msg = { 
+      type: 'success', 
+      text: `Stok berhasil ditambahkan! Sisa stok tersedia saat ini: ${result.remainingStock}` 
+    };
   } catch (e) {
-    req.session._msg = { type: 'error', text: 'Gagal: ' + e.message };
+    req.session._msg = { type: 'error', text: 'Gagal menambah stok: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+// Transaksi: 2. Pengeluaran Barang (OUT / ISSUE)
+router.post('/inventory/stock/out', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const actor = req.session.adminUser || (req.session.user && req.session.user.name) || 'Admin';
+    const result = inventorySvc.issueStock(req.body, actor);
+    req.session._msg = { 
+      type: 'success', 
+      text: `Pengeluaran barang berhasil dicatat! (-${result.qtyDeducted}). Sisa stok di gudang: ${result.remainingStock}` 
+    };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal mengeluarkan barang: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+// Transaksi: 3. Penyesuaian Stok (STOCK OPNAME / ADJUST)
+router.post('/inventory/stock/adjust', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const actor = req.session.adminUser || (req.session.user && req.session.user.name) || 'Admin';
+    const result = inventorySvc.adjustStock(req.body, actor);
+    const diffSign = result.diff > 0 ? '+' : '';
+    req.session._msg = { 
+      type: 'success', 
+      text: `Penyesuaian stok berhasil! Selisih: ${diffSign}${result.diff}. Sisa stok fisik sekarang: ${result.remainingStock}` 
+    };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal penyesuaian stok: ' + e.message };
+  }
+  res.redirect('/admin/inventory');
+});
+
+// Transaksi: 4. Pengembalian Barang (RETURN / COPOTAN)
+router.post('/inventory/stock/return', requireAdminSession, express.urlencoded({ extended: true }), (req, res) => {
+  try {
+    const actor = req.session.adminUser || (req.session.user && req.session.user.name) || 'Admin';
+    const result = inventorySvc.returnStock(req.body, actor);
+    req.session._msg = { 
+      type: 'success', 
+      text: `Pengembalian barang berhasil dicatat! Sisa stok tersedia di gudang: ${result.remainingStock}` 
+    };
+  } catch (e) {
+    req.session._msg = { type: 'error', text: 'Gagal mencatat pengembalian: ' + e.message };
   }
   res.redirect('/admin/inventory');
 });
@@ -7316,7 +7687,162 @@ router.post('/onu-provision/scan-configured', requireAdminSession, restrictToAdm
 });
 
 // ============================================================================
-// --- RUTE TUNGGAL PROVISION ONU (BERBASIS DATABASE OLT & MIB SNMP) ---
+// >>> AWAL PERBAIKAN: SCAN UNCONFIGURED MURNI MIB AUTOFIND C-DATA (.4.7.1) <<<
+// ============================================================================
+router.post(
+  '/onu-provision/scan-unconfigured',
+  requireAdminSession,
+  restrictToAdmin,
+  express.json(),
+  async (req, res) => {
+    let session;
+
+    try {
+      const oltId = Number(req.body?.oltId);
+      const olt = oltId
+        ? oltSvc.getOltById(oltId)
+        : (oltSvc.getActiveOlts()?.[0] || oltSvc.getAllOlts()?.[0]);
+
+      if (!olt) {
+        return res.status(400).json({
+          success: false,
+          error: 'OLT tidak ditemukan di database'
+        });
+      }
+
+      const community = String(olt.snmp_community || 'private').trim();
+      const snmp = require('net-snmp');
+
+      session = snmp.createSession(olt.host, community, {
+        port: Number(olt.snmp_port) || 161,
+        version: snmp.Version2c,
+        timeout: 5000,
+        retries: 1
+      });
+
+      // MIB Tabel Auto-Find C-Data GPON yang terverifikasi lewat walk (.4.7.1)
+      const baseAutofind = '1.3.6.1.4.1.17409.2.8.4.7.1';
+      const modelOid     = `${baseAutofind}.2`; // Equipment ID (misal F670LV9.0)
+      const serialOid    = `${baseAutofind}.3`; // Serial Number (misal ZTEG-D4BDF9E0)
+      const loidOid      = `${baseAutofind}.5`; // LOID
+
+      // Helper walk kolom
+      const walkColumn = (oid) => new Promise((resolve) => {
+        const values = {};
+        session.subtree(
+          oid,
+          20,
+          (varbinds) => {
+            for (const vb of varbinds || []) {
+              if (!vb?.oid || snmp.isVarbindError(vb)) continue;
+              const prefix = `${oid}.`;
+              if (!vb.oid.startsWith(prefix)) continue;
+              const index = vb.oid.slice(prefix.length);
+              values[index] = vb.value;
+            }
+          },
+          () => resolve(values)
+        );
+      });
+
+      // Ambil data Serial Number, Model, dan LOID secara paralel
+      const [serials, models, loids] = await Promise.all([
+        walkColumn(serialOid),
+        walkColumn(modelOid),
+        walkColumn(loidOid)
+      ]);
+
+      // Ambil daftar ONU yang sudah terdaftar untuk menentukan alokasi ID berikutnya
+      const existingStatusMap = await walkColumn('1.3.6.1.4.1.17409.2.8.4.1.1.7');
+      const usedIds = new Set();
+      for (const idx of Object.keys(existingStatusMap)) {
+        const n = Number(idx);
+        if (Number.isFinite(n) && n > 4718592) {
+          usedIds.add(n - 4718592);
+        }
+      }
+
+      // Hitung ID kosong pertama yang belum terpakai (1 s/d 128)
+      let nextAvailableId = 1;
+      for (let i = 1; i <= 128; i++) {
+        if (!usedIds.has(i)) {
+          nextAvailableId = i;
+          break;
+        }
+      }
+
+      const onus = [];
+      for (const index of Object.keys(serials)) {
+        const rawSerial = serials[index];
+        let snClean = '';
+
+        if (Buffer.isBuffer(rawSerial)) {
+          snClean = rawSerial.toString('utf8').replace(/\0/g, '').trim();
+        } else if (rawSerial != null) {
+          snClean = String(rawSerial).trim();
+        }
+
+        // Hapus tanda strip jika ada (ZTEG-D4BDF9E0 -> ZTEGD4BDF9E0)
+        snClean = snClean.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+        if (!snClean) continue;
+
+        // Model / Equipment ID
+        const rawModel = models[index];
+        const modelClean = rawModel
+          ? (Buffer.isBuffer(rawModel) ? rawModel.toString('utf8') : String(rawModel)).replace(/\0/g, '').trim()
+          : 'GPON-ONU';
+
+        // LOID
+        const rawLoid = loids[index];
+        const loidClean = rawLoid
+          ? (Buffer.isBuffer(rawLoid) ? rawLoid.toString('utf8') : String(rawLoid)).replace(/\0/g, '').trim()
+          : '';
+
+        // Hitung port PON dari index (contoh: 4718593 -> port 1)
+        const numericIndex = Number(index);
+        let portNum = 1;
+        if (Number.isFinite(numericIndex)) {
+          portNum = ((numericIndex >> 16) & 0xff) || 1;
+        }
+
+        onus.push({
+          index,
+          onuId: nextAvailableId++, // Alokasi otomatis kandidat nomor ONU berikutnya
+          pon: `0/0/${portNum}`,
+          port: String(portNum),
+          sn: snClean,
+          loid: loidClean,
+          model: modelClean,
+          vendor: 'C-Data'
+        });
+      }
+
+      return res.json({
+        success: true,
+        oltId: olt.id,
+        oltName: olt.name,
+        onus
+      });
+    } catch (error) {
+      logger.error('Scan unconfigured ONUs via SNMP error:', error);
+      return res.status(500).json({
+        success: false,
+        error: error.message
+      });
+    } finally {
+      try {
+        session?.close();
+      } catch {}
+    }
+  }
+);
+// ============================================================================
+// >>> AKHIR PERBAIKAN: SCAN UNCONFIGURED MURNI MIB AUTOFIND C-DATA (.4.7.1) <<<
+// ============================================================================
+
+
+// ============================================================================
+// >>> AWAL PERBAIKAN: ROUTE BIND ONU VIA TELNET (KREDENSIAL DARI DATABASE) <<<
 // ============================================================================
 router.post('/onu-provision/provision', requireAdminSession, restrictToAdmin, express.urlencoded({ extended: true }), async (req, res) => {
   try {
@@ -7333,10 +7859,10 @@ router.post('/onu-provision/provision', requireAdminSession, restrictToAdmin, ex
       throw new Error('Data OLT tidak ditemukan di database.');
     }
 
-    const { name, sn, onuId } = req.body;
+    const { name, sn, onuId, pon, authPolicy } = req.body;
     if (!sn) throw new Error('Serial Number (SN) wajib diisi');
 
-    // Auto alokasi nomor ONU ID jika kosong
+    // Auto alokasi nomor ONU ID berikutnya jika tidak diisi atau 0
     let targetOnuId = parseInt(onuId, 10);
     if (!targetOnuId || isNaN(targetOnuId)) {
       const currentStats = await oltSvc.getOltStats(olt.id, true);
@@ -7353,18 +7879,23 @@ router.post('/onu-provision/provision', requireAdminSession, restrictToAdmin, ex
       }
     }
 
-    logger.info(`[ONU Provision] Menjalankan otorisasi ${name} (${sn}) pada OLT ${olt.name} (ID: ${olt.id})...`);
+    const cleanPon = pon || '0/0/1';
+    const cleanPolicy = authPolicy || 'default-mult-srv-profile';
 
-    // Eksekusi otorisasi murni via MIB SNMP
-    await oltSvc.authorizeOnuBySnmp(olt.id, {
-      index: targetOnuId,
-      sn: sn,
-      name: name
+    logger.info(`[ONU Provision] Menjalankan otorisasi CLI Telnet ${name || 'ONT'} (${sn}) pada OLT ${olt.name} (${olt.host}) ID: ${targetOnuId}...`);
+
+    // Eksekusi Bind via Telnet (kredensial otomatis dibaca dari database OLT)
+    const result = await onuProvisionSvc.cdataProvisionONU(olt, {
+      pon: cleanPon,
+      onuId: targetOnuId,
+      sn: sn.trim(),
+      name: name,
+      authPolicy: cleanPolicy
     });
 
     req.session._msg = { 
       type: 'success', 
-      text: `✅ ONU ${name || ''} berhasil diotorisasi di OLT ${olt.name} (Index/ID: ${targetOnuId})!` 
+      text: `✅ ${result.message}` 
     };
   } catch (error) {
     logger.error('[Provision Error]:', error.message);
@@ -7376,7 +7907,9 @@ router.post('/onu-provision/provision', requireAdminSession, restrictToAdmin, ex
   
   res.redirect('/admin/onu-provision');
 });
-// --- AKHIR SATUKAN ROUTE PROVISION ---
+// ============================================================================
+// >>> AKHIR PERBAIKAN: ROUTE BIND ONU VIA TELNET (KREDENSIAL DARI DATABASE) <<<
+// ============================================================================
 
 // --- AWAL KODE BARU DELETE ONU SNMP ---
 router.post('/onu-provision/delete', requireAdminSession, restrictToAdmin, express.json(), async (req, res) => {
@@ -7652,5 +8185,119 @@ router.post('/radius/nas/delete', requireAdminSession, restrictToAdmin, async (r
   }
   res.redirect('/admin/radius-settings');
 });
+
+// ============================================================================
+// >>> BACKGROUND WORKER: AKUMULASI TRAFIK BULANAN OTOMATIS DI LATAR BELAKANG <<<
+// ============================================================================
+const backgroundTrafficWorkerInterval = 30000; // Berjalan setiap 30 detik
+
+setInterval(async () => {
+  try {
+    // 1. Ambil semua pelanggan yang memiliki username pppoe / hotspot
+    const customersToSync = db.prepare(`
+      SELECT id, router_id, pppoe_username, hotspot_username,
+             COALESCE(bytes_in, 0) as bytes_in,
+             COALESCE(bytes_out, 0) as bytes_out,
+             COALESCE(bytes_in_daily, 0) as bytes_in_daily,
+             COALESCE(bytes_out_daily, 0) as bytes_out_daily,
+             COALESCE(last_raw_rx, 0) as last_raw_rx,
+             COALESCE(last_raw_tx, 0) as last_raw_tx
+      FROM customers 
+      WHERE (pppoe_username IS NOT NULL AND TRIM(pppoe_username) != '') 
+         OR (hotspot_username IS NOT NULL AND TRIM(hotspot_username) != '')
+    `).all();
+
+    if (!customersToSync || customersToSync.length === 0) return;
+
+    // 2. Kelompokkan berdasarkan router_id agar efisien saat memanggil API MikroTik
+    const routersMap = new Map();
+    for (const c of customersToSync) {
+      let rId = c.router_id ? Number(c.router_id) : null;
+      if (!rId || rId <= 0) {
+        const defR = mikrotikService.getAllRouters()?.[0];
+        rId = defR ? defR.id : null;
+      }
+      if (!routersMap.has(rId)) routersMap.set(rId, []);
+      routersMap.get(rId).push(c);
+    }
+
+    // 3. Lakukan looping per router
+    for (const [routerId, custs] of routersMap.entries()) {
+      let conn = null;
+      try {
+        conn = routerId ? await mikrotikService.getConnection(routerId) : await mikrotikService.getConnection();
+        if (!conn || !conn.client) continue;
+
+        // Tarik semua interface router dalam 1x request agar ringan
+        const interfaces = await conn.client.menu('/interface').get().catch(() => []);
+        if (!interfaces || interfaces.length === 0) continue;
+
+        const ifaceMap = new Map();
+        for (const iface of interfaces) {
+          ifaceMap.set(String(iface.name || '').toLowerCase(), iface);
+        }
+
+        // 4. Update data trafik tiap pelanggan
+        for (const cust of custs) {
+          const uname = String(cust.pppoe_username || cust.hotspot_username || '').trim().toLowerCase();
+          if (!uname) continue;
+
+          // Cari interface yang cocok dengan nama user secara fleksibel
+          const matchedIface = ifaceMap.get(`<pppoe-${uname}>`) || 
+                               ifaceMap.get(`pppoe-${uname}`) || 
+                               (interfaces || []).find(i => String(i.name || '').toLowerCase().includes(uname));
+
+          if (!matchedIface) continue;
+
+          // Ambil byte absolut dari MikroTik
+          // tx-byte = Download (Router ke Klien) -> Masuk ke bytes_in
+          // rx-byte = Upload (Klien ke Router) -> Masuk ke bytes_out
+          const rawDownloadBytes = numField(matchedIface, ['tx-byte', 'txBytes', 'bytes-out', 'bytesOut']);
+          const rawUploadBytes   = numField(matchedIface, ['rx-byte', 'rxBytes', 'bytes-in', 'bytesIn']);
+
+          const lastRawRx = Number(cust.last_raw_rx || 0);
+          const lastRawTx = Number(cust.last_raw_tx || 0);
+
+          let deltaRx = 0;
+          let deltaTx = 0;
+
+          // Hitung selisih (delta) dengan pengaman jika MikroTik reboot (counter balik ke 0)
+          if (rawDownloadBytes >= lastRawRx) {
+            deltaRx = rawDownloadBytes - lastRawRx;
+          } else {
+            deltaRx = rawDownloadBytes;
+          }
+
+          if (rawUploadBytes >= lastRawTx) {
+            deltaTx = rawUploadBytes - lastRawTx;
+          } else {
+            deltaTx = rawUploadBytes;
+          }
+
+          // Jika ada penambahan data, simpan secara persisten ke database
+          if (deltaRx > 0 || deltaTx > 0) {
+            db.prepare(`
+              UPDATE customers 
+              SET bytes_in_daily = bytes_in_daily + ?,  
+                  bytes_out_daily = bytes_out_daily + ?,
+                  bytes_in = bytes_in + ?,              
+                  bytes_out = bytes_out + ?,
+                  last_raw_rx = ?,
+                  last_raw_tx = ?
+              WHERE id = ?
+            `).run(deltaRx, deltaTx, deltaRx, deltaTx, rawDownloadBytes, rawUploadBytes, cust.id);
+          }
+        }
+      } catch (routerErr) {
+        // Abaikan error koneksi sesaat pada router tertentu agar loop tidak berhenti
+      } finally {
+        if (conn && conn.api) { try { conn.api.close(); } catch {} }
+      }
+    }
+  } catch (err) {
+    // Background worker silent error handler
+  }
+}, backgroundTrafficWorkerInterval);
+// ============================================================================
 
 module.exports = router;
